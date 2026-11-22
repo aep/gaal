@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27.x"
+  # Every test step passes in about a minute, so a hang fails fast.
+  TIMEOUT: 3m
+  TEST_SECONDS: "180"
+
+jobs:
+  cross:
+    name: Compile every target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: make fmt
+      - run: make cross
+
+  linux:
+    name: Linux ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Arch ships the libvpx and OpenH264 versions gaal's layouts target.
+          - name: Arch x86-64
+            runner: ubuntu-24.04
+            container: archlinux:latest
+            require: >-
+              h264/encode/openh264,h264/decode/openh264,
+              vp8/encode/libvpx,vp8/decode/libvpx,
+              vp9/encode/libvpx,vp9/decode/libvpx,
+              jpeg/encode/turbojpeg,jpeg/decode/turbojpeg,
+              jpeg/encode/go-image-jpeg,jpeg/decode/go-image-jpeg,
+              opus/encode/libopus,opus/decode/libopus,
+              pcmu/encode/g711,pcmu/decode/g711,pcma/encode/g711,pcma/decode/g711,
+              aac/encode/libfdk-aac,aac/decode/libfdk-aac,
+              mp3/encode/libmp3lame,mp3/decode/libmpg123,
+              flac/encode/libflac,flac/decode/libflac,
+              vorbis/encode/libvorbis,vorbis/decode/libvorbis,
+              ac3/decode/liba52
+          - name: Ubuntu x86-64
+            runner: ubuntu-24.04
+            container: ""
+            require: jpeg/encode/turbojpeg,jpeg/decode/turbojpeg,opus/encode/libopus,opus/decode/libopus
+          - name: Ubuntu arm64
+            runner: ubuntu-24.04-arm
+            container: ""
+            require: jpeg/encode/turbojpeg,jpeg/decode/turbojpeg,opus/encode/libopus,opus/decode/libopus
+    env:
+      CGO_ENABLED: "0"
+      GAAL_REQUIRE: ${{ matrix.require }}
+    steps:
+      - name: Install codec libraries (Arch)
+        if: startsWith(matrix.container, 'archlinux')
+        run: |
+          pacman -Syu --noconfirm --needed git make gcc ffmpeg libvpx opus libjpeg-turbo openh264 \
+            libfdk-aac lame mpg123 flac libvorbis a52dec
+      - name: Install codec libraries (Ubuntu)
+        if: matrix.container == ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libopus0 libturbojpeg libfdk-aac2 libmp3lame0 libmpg123-0 \
+            libflac12t64 libvorbis0a libvorbisenc2 liba52-0.7.4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: make vet
+      - run: make conformance
+      - run: make allocs
+      - run: make test
+
+  macos:
+    name: macOS ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15]
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - run: brew install opus libvpx jpeg-turbo
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: make vet
+      - run: make conformance
+      - run: make allocs
+      - run: make test
+
+  ios:
+    name: iOS compile
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build tests for iOS
+        run: |
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CC="$(xcrun --sdk iphoneos --find clang)"
+          export CGO_CFLAGS="-isysroot $sdk -arch arm64 -miphoneos-version-min=16.0"
+          export CGO_LDFLAGS="$CGO_CFLAGS"
+          go vet .
+          go test -c -o "$RUNNER_TEMP/gaal.test" .
+
+  windows:
+    name: Windows ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go vet .
+      - run: go test -count=1 -timeout 3m -run "TestRequiredBackends|TestConformance" -v .
+      - run: go test -count=1 -timeout 3m -run "Alloc|TestAudioRoundTrip" -v .
+      - run: go test -count=1 -timeout 3m ./...
+
+  android:
+    name: Android emulator API ${{ matrix.api }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [30, 35]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: make test-android ANDROID_ARCH=amd64
+
+  hardware:
+    name: Hardware runner
+    if: vars.GAAL_HARDWARE_RUNNER == 'true'
+    runs-on: [self-hosted, gaal-gpu]
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: "0"
+      GAAL_REQUIRE: ${{ vars.GAAL_HARDWARE_REQUIRE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: make conformance
+      - run: make allocs
+      - run: make bench BENCH=Matrix
